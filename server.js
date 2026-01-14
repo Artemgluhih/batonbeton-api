@@ -1,166 +1,225 @@
-const express = require('express')
-const http = require('http')
-const socketIO = require('socket.io')
-const cors = require('cors')
-require('dotenv').config()
+const express = require('express');
+const http = require('http');
+const socketIO = require('socket.io');
+const cors = require('cors');
+const { Pool } = require('pg');
+require('dotenv').config();
 
-const app = express()
-const server = http.createServer(app)
+const app = express();
+const server = http.createServer(app);
 const io = socketIO(server, {
-	cors: {
-		origin: '*',
-		methods: ['GET', 'POST'],
-	},
-})
+  cors: {
+    origin: '*',
+    methods: ['GET', 'POST'],
+  },
+});
+
+// ==================== БД ПОДКЛЮЧЕНИЕ ====================
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }, // обязательно для Render!
+});
+
+pool.on('error', (err) => {
+  console.error('❌ Ошибка БД:', err);
+});
 
 // Middleware
 app.use(
-	cors({
-		origin: '*', // Разрешить все источники (временно для тестирования!)
-		methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
-		credentials: true,
-	})
-)
-app.use(express.json())
+  cors({
+    origin: '*',
+    methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
+    credentials: true,
+  })
+);
+app.use(express.json());
 
-// Хранилище забронированных дат (в production используй БД!)
-let bookedDates = []
+// ==================== ИНИЦИАЛИЗАЦИЯ БД ====================
+async function initDB() {
+  try {
+    // Создаём таблицу, если её нет
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS booked_dates (
+        id SERIAL PRIMARY KEY,
+        date VARCHAR(10) UNIQUE NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    console.log('✅ Таблица готова');
 
-// Подключение клиентов
-io.on('connection', socket => {
-	console.log('🟢 Новый клиент подключен:', socket.id)
+    // Загружаем даты в память при запуске (для Socket.io)
+    const result = await pool.query('SELECT date FROM booked_dates ORDER BY date ASC');
+    bookedDates = result.rows.map((row) => row.date);
+    console.log(`📅 Загружено ${bookedDates.length} забронированных дат`);
+  } catch (err) {
+    console.error('❌ Ошибка инициализации БД:', err);
+  }
+}
 
-	// Отправляем актуальные даты при подключении
-	socket.emit('updateDates', bookedDates)
+// Вызовем инициализацию
+initDB();
 
-	socket.on('disconnect', () => {
-		console.log('🔴 Клиент отключен:', socket.id)
-	})
-})
+// Хранилище для быстрого доступа (синхронизировано с БД)
+let bookedDates = [];
+
+// ==================== ПОДКЛЮЧЕНИЕ КЛИЕНТОВ ====================
+io.on('connection', (socket) => {
+  console.log('🟢 Новый клиент подключен:', socket.id);
+  socket.emit('updateDates', bookedDates);
+  socket.on('disconnect', () => {
+    console.log('🔴 Клиент отключен:', socket.id);
+  });
+});
 
 // ==================== API ENDPOINTS ====================
 
 // GET: получить все забронированные даты
 app.get('/api/booked-dates', (req, res) => {
-	res.json({
-		success: true,
-		dates: bookedDates,
-	})
-})
+  res.json({
+    success: true,
+    dates: bookedDates,
+  });
+});
 
 // POST: добавить забронированную дату
-app.post('/api/admin/block-date', (req, res) => {
-	const { date, secret } = req.body
+app.post('/api/admin/block-date', async (req, res) => {
+  const { date, secret } = req.body;
 
-	// Проверка секретного ключа
-	if (secret !== process.env.API_SECRET) {
-		return res.status(401).json({
-			success: false,
-			message: 'Неверный API ключ',
-		})
-	}
+  // Проверка секретного ключа
+  if (secret !== process.env.API_SECRET) {
+    return res.status(401).json({
+      success: false,
+      message: 'Неверный API ключ',
+    });
+  }
 
-	// Валидация даты
-	if (!isValidDate(date)) {
-		return res.status(400).json({
-			success: false,
-			message: 'Неверный формат даты (используй YYYY-MM-DD)',
-		})
-	}
+  // Валидация даты
+  if (!isValidDate(date)) {
+    return res.status(400).json({
+      success: false,
+      message: 'Неверный формат даты (используй ДД-ММ-ГГГГ)',
+    });
+  }
 
-	// Проверка дубликата
-	if (bookedDates.includes(date)) {
-		return res.status(400).json({
-			success: false,
-			message: 'Эта дата уже забронирована',
-		})
-	}
+  // Проверка дубликата в памяти
+  if (bookedDates.includes(date)) {
+    return res.status(400).json({
+      success: false,
+      message: 'Эта дата уже забронирована',
+    });
+  }
 
-	// Добавляем дату
-	bookedDates.push(date)
-	bookedDates.sort()
+  try {
+    // Добавляем в БД
+    await pool.query(
+      'INSERT INTO booked_dates (date) VALUES ($1)',
+      [date]
+    );
 
-	console.log(`📅 Дата заблокирована: ${date}`)
+    // Добавляем в память
+    bookedDates.push(date);
+    bookedDates.sort();
 
-	// Отправляем обновление всем подключенным клиентам
-	io.emit('updateDates', bookedDates)
+    console.log(`📅 Дата заблокирована: ${date}`);
 
-	res.json({
-		success: true,
-		message: `Дата ${date} заблокирована`,
-		dates: bookedDates,
-	})
-})
+    // Отправляем обновление всем клиентам через Socket.io
+    io.emit('updateDates', bookedDates);
+
+    res.json({
+      success: true,
+      message: `Дата ${date} заблокирована`,
+      dates: bookedDates,
+    });
+  } catch (err) {
+    console.error('❌ Ошибка при добавлении даты:', err);
+    res.status(500).json({
+      success: false,
+      message: 'Ошибка сервера',
+    });
+  }
+});
 
 // DELETE: разблокировать дату
-app.delete('/api/admin/unblock-date', (req, res) => {
-	const { date, secret } = req.body
+app.delete('/api/admin/unblock-date', async (req, res) => {
+  const { date, secret } = req.body;
 
-	if (secret !== process.env.API_SECRET) {
-		return res.status(401).json({
-			success: false,
-			message: 'Неверный API ключ',
-		})
-	}
+  if (secret !== process.env.API_SECRET) {
+    return res.status(401).json({
+      success: false,
+      message: 'Неверный API ключ',
+    });
+  }
 
-	if (!isValidDate(date)) {
-		return res.status(400).json({
-			success: false,
-			message: 'Неверный формат даты',
-		})
-	}
+  if (!isValidDate(date)) {
+    return res.status(400).json({
+      success: false,
+      message: 'Неверный формат даты',
+    });
+  }
 
-	const index = bookedDates.indexOf(date)
-	if (index === -1) {
-		return res.status(400).json({
-			success: false,
-			message: 'Эта дата не забронирована',
-		})
-	}
+  const index = bookedDates.indexOf(date);
+  if (index === -1) {
+    return res.status(400).json({
+      success: false,
+      message: 'Эта дата не забронирована',
+    });
+  }
 
-	bookedDates.splice(index, 1)
+  try {
+    // Удаляем из БД
+    await pool.query(
+      'DELETE FROM booked_dates WHERE date = $1',
+      [date]
+    );
 
-	console.log(`📅 Дата разблокирована: ${date}`)
+    // Удаляем из памяти
+    bookedDates.splice(index, 1);
 
-	// Отправляем обновление всем клиентам
-	io.emit('updateDates', bookedDates)
+    console.log(`📅 Дата разблокирована: ${date}`);
 
-	res.json({
-		success: true,
-		message: `Дата ${date} разблокирована`,
-		dates: bookedDates,
-	})
-})
+    // Отправляем обновление всем клиентам
+    io.emit('updateDates', bookedDates);
+
+    res.json({
+      success: true,
+      message: `Дата ${date} разблокирована`,
+      dates: bookedDates,
+    });
+  } catch (err) {
+    console.error('❌ Ошибка при удалении даты:', err);
+    res.status(500).json({
+      success: false,
+      message: 'Ошибка сервера',
+    });
+  }
+});
 
 // Health check
 app.get('/health', (req, res) => {
-	res.json({ status: 'OK' })
-})
+  res.json({ status: 'OK' });
+});
 
 // ==================== HELPER FUNCTIONS ====================
-
 function isValidDate(dateString) {
-	// Формат: ДД-МММ-ГГГГ
-	const regex = /^\d{2}-\d{2}-\d{4}$/
-	if (!regex.test(dateString)) return false
+  const regex = /^\d{2}-\d{2}-\d{4}$/;
+  if (!regex.test(dateString)) return false;
 
-	const [day, month, year] = dateString.split('-')
-	const date = new Date(`${year}-${month}-${day}`)
+  const [day, month, year] = dateString.split('-');
+  const date = new Date(`${year}-${month}-${day}`);
 
-	return (
-		date instanceof Date &&
-		!isNaN(date) &&
-		parseInt(day) > 0 &&
-		parseInt(day) <= 31 &&
-		parseInt(month) > 0 &&
-		parseInt(month) <= 12
-	)
+  return (
+    date instanceof Date &&
+    !isNaN(date) &&
+    parseInt(day) > 0 &&
+    parseInt(day) <= 31 &&
+    parseInt(month) > 0 &&
+    parseInt(month) <= 12
+  );
 }
 
 // ==================== START SERVER ====================
-
-const PORT = process.env.PORT || 5000
+const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => {
-	console.log(`\n🚀 API сервер запущен на http://localhost:${PORT}`)
-	console.log(`📡 WebSocket доступен на ws://localhost:${PORT}\n`)
-})
+  console.log(`\n🚀 API сервер запущен на http://localhost:${PORT}`);
+  console.log(`📡 WebSocket доступен на ws://localhost:${PORT}\n`);
+});
