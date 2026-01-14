@@ -5,7 +5,7 @@ require('dotenv').config()
 const token = process.env.TELEGRAM_BOT_TOKEN
 const bot = new TelegramBot(token, { polling: true })
 
-const API_URL = 'http://localhost:5000'
+const API_URL = 'https://batonbeton-api.onrender.com'
 const API_SECRET = process.env.API_SECRET
 
 bot.onText(/\/start/, msg => {
