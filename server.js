@@ -16,8 +16,7 @@ const io = socketIO(server, {
 
 // ==================== БД ПОДКЛЮЧЕНИЕ ====================
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }, // обязательно для Render!
+connectionString: process.env.DATABASE_URL || `postgres://${process.env.DB_USER}:${process.env.DB_PASSWORD}@${process.env.DB_HOST}:${process.env.DB_PORT}/${process.env.DB_NAME}`
 });
 
 pool.on('error', (err) => {
@@ -34,29 +33,15 @@ app.use(
 );
 app.use(express.json());
 
-// ==================== ИНИЦИАЛИЗАЦИЯ БД ====================
+// Инициализация БД при старте
 async function initDB() {
-  try {
-    // Создаём таблицу, если её нет
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS booked_dates (
-        id SERIAL PRIMARY KEY,
-        date VARCHAR(10) UNIQUE NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
-    console.log('✅ Таблица готова');
-
-    // Загружаем даты в память при запуске (для Socket.io)
-    const result = await pool.query('SELECT date FROM booked_dates ORDER BY date ASC');
-    bookedDates = result.rows.map((row) => row.date);
-    console.log(`📅 Загружено ${bookedDates.length} забронированных дат`);
-  } catch (err) {
-    console.error('❌ Ошибка инициализации БД:', err);
-  }
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS bookings (
+      date TEXT PRIMARY KEY
+    )
+  `);
+  console.log('✅ БД готова');
 }
-
-// Вызовем инициализацию
 initDB();
 
 // Хранилище для быстрого доступа (синхронизировано с БД)
